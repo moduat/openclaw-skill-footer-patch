@@ -167,7 +167,7 @@ function compactNumber(value) {
     }
     if (abs >= 1_000) {
         const k = value / 1_000;
-        return Math.abs(k) >= 100 ? `${Math.round(k)}k` : `${k.toFixed(1)}k`;
+        return Math.abs(k) >= 1000 ? `${Math.round(k)}k` : `${k.toFixed(1)}k`;
     }
     return `${Math.round(value)}`;
 }

@@ -36,6 +36,8 @@ function extractAgentIdFromSessionKey(sessionKey) {
     const match = sessionKey.trim().toLowerCase().match(/^agent:([^:]+):/);
     return match?.[1];
 }
+// v2026.04.28-2: per-session delta tracking (module-level, survives across controllers)
+const _transcriptTokenTrackers = new Map();
 function collectFooterMetrics(entry, extra) {
     const inT = typeof entry.inputTokens === 'number' ? entry.inputTokens : undefined;
     const outT = typeof entry.outputTokens === 'number' ? entry.outputTokens : undefined;
@@ -806,24 +808,26 @@ class StreamingCardController {
         }
     }
     _publishTokenEvent(footerMetrics) {
-        try {
-            if (!footerMetrics) return;
-            const totalTokens = footerMetrics.totalTokens
-                ?? ((footerMetrics.inputTokens ?? 0) + (footerMetrics.outputTokens ?? 0));
-            if (totalTokens > 0) {
-                const { publish } = require('./event-bus.js');
+        if (footerMetrics?.inputTokens != null || footerMetrics?.outputTokens != null) {
+            try {
+                const currentTotal = (footerMetrics.inputTokens || 0) + (footerMetrics.outputTokens || 0);
+                if (currentTotal <= 0) return;
+                // v2026.04.30: cumulative mode — tracker.cumulative += delta
+                // currentTotal = per-run transcript total (input+output only, no cacheRead)
+                const tracker = _transcriptTokenTrackers.get(this.deps.sessionKey) || { cumulative: 0 };
+                const delta = currentTotal;
+                tracker.cumulative += delta;
+                _transcriptTokenTrackers.set(this.deps.sessionKey, tracker);
+                const { publish } = require('../channel/event-bus.js');
                 publish('session_tokens_accrued', {
+                    tokens: delta,
+                    inputTokens: footerMetrics.inputTokens || 0,
+                    outputTokens: footerMetrics.outputTokens || 0,
                     sessionKey: this.deps.sessionKey,
-                    tokens: totalTokens,
-                    inputTokens: footerMetrics.inputTokens,
-                    outputTokens: footerMetrics.outputTokens,
-                    cacheRead: footerMetrics.cacheRead,
-                    cacheWrite: footerMetrics.cacheWrite,
-                    model: footerMetrics.model,
-                    contextTokens: footerMetrics.contextTokens,
+                    timestamp: new Date().toISOString(),
                 });
-            }
-        } catch { /* ignore */ }
+            } catch { /* ignore */ }
+        }
     }
     // ------------------------------------------------------------------
     // Internal: card creation

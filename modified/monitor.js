@@ -132,7 +132,7 @@ function ensureHealthCheck(tokenStatsPath, log) {
         }
     }, CHECK_INTERVAL_MS);
     if (_healthCheckTimer.unref) _healthCheckTimer.unref();
-    log('[health-check] watchdog started (interval=60s, threshold=120s)');
+    log('[health-check] watchdog started (interval=60s, threshold=360s)');
 }
 // ---------------------------------------------------------------------------
 /**

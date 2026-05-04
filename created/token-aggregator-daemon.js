@@ -7,6 +7,7 @@ const { existsSync, readFileSync, writeFileSync, readdirSync } = require('node:f
 const { join, basename } = require('node:path');
 const { homedir } = require('node:os');
 const SCAN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const SHANGHAI_OFFSET_MS = 8 * 3600 * 1000;
 let _timer = null;
 let daemonLastFlushMs = 0;
 let _tokenStatsPath = null;
@@ -17,13 +18,23 @@ let daemonToday = 0;
 let daemonMonth = 0;
 /** @type {Map<string, {lastLineIndex: number, lastTotalTokens: number}>} */
 let fileState = new Map();
+// Must use UTC methods (getUTCFullYear etc), locale independent.
+// Do NOT use toLocaleDateString() — different locales use different separators.
 function getShanghaiDateKey() {
-    const now = new Date();
-    // en-CA locale returns 'YYYY-MM-DD' directly
-    return now.toLocaleString('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' });
+    const d = new Date(Date.now() + SHANGHAI_OFFSET_MS);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 function getShanghaiMonthKey() {
     return getShanghaiDateKey().substring(0, 7);
+}
+function getShanghaiTimeWindow() {
+    const nowUtc = Date.now();
+    const shanghaiNow = new Date(nowUtc + SHANGHAI_OFFSET_MS);
+    const todayShanghai = new Date(shanghaiNow);
+    todayShanghai.setUTCHours(0, 0, 0, 0);
+    const todayStartMs = todayShanghai.getTime() - SHANGHAI_OFFSET_MS;
+    const monthStartMs = Date.UTC(shanghaiNow.getUTCFullYear(), shanghaiNow.getUTCMonth(), 1) - SHANGHAI_OFFSET_MS;
+    return { todayStartMs, monthStartMs };
 }
 function parseTimestamp(value) {
     if (typeof value === 'number' && value > 0) {
@@ -69,6 +80,7 @@ function scanJsonlFile(filePath, fileKey, isRecount, startOfDayMs, startOfMonthM
     const lines = content.split('\n');
     let delta = 0;
     for (let i = state.lastLineIndex; i < lines.length; i++) {
+        state.lastLineIndex = i + 1; // Always advance, even for skipped lines
         const trimmed = lines[i].trim();
         if (!trimmed) continue;
         let entry;
@@ -82,7 +94,6 @@ function scanJsonlFile(filePath, fileKey, isRecount, startOfDayMs, startOfMonthM
         }
         const total = tokens.input + tokens.output;
         delta += total;
-        state.lastLineIndex = i + 1;
     }
     state.lastTotalTokens += delta;
     return delta;
@@ -93,31 +104,53 @@ function scanCronRuns() {
     const monthKey = getShanghaiMonthKey();
     const dateChanged = !currentDateKey || currentDateKey !== key;
     const monthChanged = currentMonthKey && currentMonthKey !== monthKey;
-    const isRecount = dateChanged || monthChanged;
+    let isRecount = dateChanged || monthChanged;
     if (isRecount) {
         if (dateChanged) daemonToday = 0;
         if (monthChanged) daemonMonth = 0;
         currentDateKey = key;
         currentMonthKey = monthKey;
     }
-    // Compute time window boundaries for recount
-    const now = new Date();
+    // Compute time window boundaries for recount (UTC+offset, not locale)
     let startOfDayMs = null;
+    let startOfMonthMs = null;
     if (isRecount) {
-        const shanghai = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
-        shanghai.setHours(0, 0, 0, 0);
-        startOfDayMs = shanghai.getTime();
+        const tw = getShanghaiTimeWindow();
+        startOfDayMs = tw.todayStartMs;
+        startOfMonthMs = tw.monthStartMs;
     }
+    // v2026.04.30 fix: new files must always use recount+date-filter
+    // (prevents counting all historical tokens when fileState is empty)
     let totalDelta = 0;
     try {
         const files = readdirSync(_cronRunsDir).filter(f => f.endsWith('.jsonl'));
+        if (!isRecount) {
+            for (const file of files) {
+                const fileKey = `cron:${file}`;
+                if (!fileState.has(fileKey)) {
+                    isRecount = true; break;
+                }
+            }
+            if (isRecount) {
+                const tw = getShanghaiTimeWindow();
+                startOfDayMs = tw.todayStartMs;
+                startOfMonthMs = tw.monthStartMs;
+            }
+        }
+        // v2026.04.30: recount must reset lastLineIndex=0 for ALL files
+        if (isRecount) {
+            for (const s of fileState.values()) {
+                s.lastTotalTokens = 0;
+                s.lastLineIndex = 0;
+            }
+        }
         for (const file of files) {
             const filePath = join(_cronRunsDir, file);
             const fileKey = `cron:${file}`;
-            const delta = scanJsonlFile(filePath, fileKey, isRecount, startOfDayMs, null);
+            const delta = scanJsonlFile(filePath, fileKey, isRecount, startOfDayMs, startOfMonthMs);
             totalDelta += delta;
         }
-    } catch { /* ignore */ }
+    } catch (e) { console.error('[daemon] scanCronRuns error:', e?.message); }
     daemonToday += totalDelta;
     daemonMonth += totalDelta;
 }
@@ -185,9 +218,24 @@ function startTokenAggregatorDaemon() {
                     }
                 }
             }
-            if (data.dateKey) currentDateKey = data.dateKey;
-            if (data.daemonToday != null) daemonToday = data.daemonToday;
-            if (data.daemonMonth != null) daemonMonth = data.daemonMonth;
+            // Bug#11: force recount on every startup
+            // Load monthKey for month boundary detection, then clear to force dateChanged=true
+            // Preserve daemonMonth — Bug#10's recalculation formula needs it
+            if (data.dateKey) currentMonthKey = data.dateKey.substring(0, 7);
+            if (typeof data.daemonMonth === 'number') daemonMonth = data.daemonMonth;
+            currentDateKey = '';
+            daemonToday = 0;
+            // Clear daemonToday in file immediately so aggregator doesn't read stale value
+            // Also subtract old daemon contribution from todayTokens so aggregator's
+            // eventPathToday = (todayTokens - _loadedDaemonToday) doesn't inflate
+            try {
+                const existing = JSON.parse(readFileSync(_tokenStatsPath, 'utf8'));
+                const oldDaemonToday = typeof existing.daemonToday === 'number' ? existing.daemonToday : 0;
+                existing.todayTokens = Math.max((existing.todayTokens || 0) - oldDaemonToday, 0);
+                existing.daemonToday = 0;
+                existing.updatedAt = new Date().toISOString();
+                writeFileSync(_tokenStatsPath, JSON.stringify(existing, null, 2));
+            } catch { /* ignore */ }
         }
     } catch { /* ignore */ }
     tick(); // Initial scan
