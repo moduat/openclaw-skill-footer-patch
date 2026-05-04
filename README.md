@@ -2,10 +2,9 @@
 
 > 飞书卡片 Footer 完整显示 Token 累计消耗、回复时间、耗时、模型、输入输出 Token、缓存命中率、上下文用量、首 token 延迟。
 
-**适用插件版本**: openclaw-lark 2026.4.10
-**补丁版本**: v1.3（2026-05-03）  
-**适配 OpenClaw**: 2026.4.23+  
-**当前 Skill 版本**: v1.2
+**适用插件版本**: openclaw-lark >= 2026.4.7（基于 2026.4.10 开发）
+**补丁版本**: v1.4（2026-05-04）
+**适配 OpenClaw**: 2026.4.23+
 
 ---
 
@@ -22,15 +21,18 @@
 
 - **4 行完整 Footer**：Token 今/月累计 → 分隔线 → 状态·耗时·模型 → Token 详情·缓存·上下文·费用·首 token 延迟
 - **双路径 Token 计数**：Event 路径（实时 Feishu 会话）+ Daemon 路径（cron/dreaming 文件扫描），互补覆盖不重复
+- **跨日自动重算**：日期变更时自动重置并重新计算今日/本月 Token
 - **跨 Gateway 重启去重**：`_sessionTotals` 持久化到 `token-stats.json`，重启后从文件恢复
-- **健康检查自愈**：60s 看门狗自动检测并重启死掉的聚合组件
+- **健康检查自愈**：60s 看门狗自动检测并重启死掉的聚合组件（360s 死亡阈值）
 - **中文状态标签**：✅已完成 / ❌出错 / ⏹️已停止
 - **精确数字**：compactNumber 阈值 1000（1,234 显示为 1.2k，不是 1k）
+- **cacheRead 纳入统计**：Token 事件包含 cacheRead + cacheWrite，与后端计费对齐
 
 ## 文件结构
 
 ```
-├── SKILL.md              # 12 章恢复指南（AI 读取用）
+├── SKILL.md              # 操作指南（AI 读取用）
+├── README.md             # 本文件
 ├── original/             # 5 个插件原始文件（备份用，对比差异用）
 │   ├── builder.js
 │   ├── footer-config.js
@@ -110,12 +112,11 @@ openclaw gateway restart
 |------|------|------|
 | 费用不显示（模型 cost 全为 0） | ⚠️ 需配置 | `openclaw.json` 中 `models.providers` 添加 cost 字段 |
 | Token 今/月首次为 0 | ✅ 正常 | 等待首次 flush（30秒）后更新 |
-| WebSocket 重连后统计中断 | ✅ 已修复 | drainShutdownHooks 后重置守卫 |
-| Error/Abort 路径 token 丢失 | ✅ 已修复 | 3 终态统一发布事件 |
+| 月累计基数跨月丢失 | ⚠️ 正常行为 | 每月 1 日 daemonMonth 重置为 0，需手动初始化保留历史 |
 
 ## 部署文档
 
-详细架构和修改说明见飞书文档：  
+详细架构和修改说明见飞书文档：
 https://wxuuvv5r88d.feishu.cn/docx/CedkdiDevoeslxxuM0pcdeQAnte
 
 ## License
